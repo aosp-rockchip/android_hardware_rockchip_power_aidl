@@ -5,19 +5,35 @@
 #include "Power.h"
 
 #include <aidl/android/hardware/power/Boost.h>
+#define LOG_TAG "PowerAIDL"
 
 #include <android-base/logging.h>
 #include <cutils/properties.h>
 #include <string>
 #include <log/log.h>
 #include <dirent.h>
+#include <inttypes.h>
 
-#define LOG_TAG "PowerAIDL"
+#include <android-base/file.h>
+#include <android-base/logging.h>
+#include <android-base/properties.h>
+#include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 
+#define DEBUG_EN 1
+
+#define BUFFER_LENGTH 64
 #define DEV_FREQ_PATH "/sys/class/devfreq"
 #define CPU_CLUST0_GOV_PATH "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
 #define CPU_CLUST1_GOV_PATH "/sys/devices/system/cpu/cpufreq/policy4/scaling_governor"
-#define DMC_GOV_PATH "/sys/class/devfreq/dmc/governor"
+#define CPU_CLUST0_SCAL_MAX_FREQ_PATH "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq"
+#define CPU_CLUST0_SCAL_MIN_FREQ_PATH "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq"
+#define CPU_CLUST1_SCAL_MAX_FREQ_PATH "/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq"
+#define CPU_CLUST1_SCAL_MIN_FREQ_PATH "/sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq"
+#define DMC_GOV_PATH "/sys/class/devfreq/dmc/system_status"
+
+static int is_inited = 0;
+static int boost_state = 0;
 
 namespace aidl {
 namespace android {
@@ -26,36 +42,77 @@ namespace power {
 namespace impl {
 namespace rockchip {
 
+std::string cpu_clust0_min_freq = "";
+std::string cpu_clust0_max_freq = "";
+std::string cpu_clust1_min_freq = "";
+std::string cpu_clust1_max_freq = "";
+std::string gpu_min_freq = "";
+std::string gpu_max_freq = "";
+
+void sysfs_read(std::string path, std::string *buf) {
+    if (!::android::base::ReadFileToString(path, buf)) {
+        ALOGE("Error to open %s\n", path.c_str());
+    } else {
+        if(DEBUG_EN) ALOGI("read from %s value %s\n", path.c_str(), buf->c_str());
+    }
+}
+
+void Power::initPlatform() {
+    if (is_inited) return;
+
+    if(DEBUG_EN) ALOGD("version 4.0\n");
+
+    sysfs_read(CPU_CLUST0_SCAL_MAX_FREQ_PATH, &cpu_clust0_max_freq);
+    sysfs_read(CPU_CLUST0_SCAL_MIN_FREQ_PATH, &cpu_clust0_min_freq);
+    sysfs_read(CPU_CLUST1_SCAL_MIN_FREQ_PATH, &cpu_clust1_min_freq);
+    sysfs_read(CPU_CLUST1_SCAL_MAX_FREQ_PATH, &cpu_clust1_max_freq);
+    sysfs_read((_gpu_path + "/min_freq").c_str(), &gpu_min_freq);
+    sysfs_read((_gpu_path + "/max_freq").c_str(), &gpu_max_freq);
+
+    is_inited = 1;
+}
+
 void Power::getSupportedPlatform() {
     char platform[PROPERTY_VALUE_MAX] = {0};
-    property_get("ro.board.platform", platform, "");
+    std::string name;
+    //property_get("ro.board.platform", platform, "");
     if (_mode_support_int < 0) {
-        //if (strncmp(platform, "rk3399", PROPERTY_VALUE_MAX) == 0) {
-            _boost_support_int = 0x003F;
-            _mode_support_int = 0x3FFF;
-        //}
+        _boost_support_int = 0x003F;
+        _mode_support_int = 0x3FFF;
     }
     if (_gpu_path == "") {
         std::unique_ptr<DIR, decltype(&closedir)>dir(opendir(DEV_FREQ_PATH), closedir);
         if (!dir) return;
         dirent* dp;
         while ((dp = readdir(dir.get())) != nullptr) {
-            if (dp->d_name[0] == '.') continue;
-            // remove dmc
-            if (dp->d_name[0] == 'd') continue;
-            std::string prefix(DEV_FREQ_PATH);
-            std::string gpu(dp->d_name);
-            _gpu_path += prefix + "/" + gpu;
-            break;
+            name = dp->d_name;
+            if (strstr(name.c_str(),"gpu") == NULL)
+                continue;
+            else {
+                std::string prefix(DEV_FREQ_PATH);
+                std::string gpu(dp->d_name);
+                _gpu_path += prefix + "/" + gpu;
+                break;
+            }
         }
     }
-    ALOGI("[%s] gpu: %s, boost: %llx, mode: %llx",
-          platform, _gpu_path.c_str(),
-          _boost_support_int, _mode_support_int);
+    if (_boot_complete <= 0) {
+        _boot_complete = property_get_bool("vendor.boot_completed", 0);
+        ALOGV("[%s] gpu: %s, boost: %" PRId64", mode: %" PRId64", boot completed: %s",
+                platform, _gpu_path.c_str(),
+                _boost_support_int, _mode_support_int,
+                _boot_complete?"true":"false");
+    }
+    initPlatform();
 }
 
 static void sysfs_write(const char *path, const char *s) {
+    ALOGV("path: %s, cpu min: %s, cpu max: %s, value: %s",
+           path, cpu_clust0_min_freq.c_str(),
+           cpu_clust0_max_freq.c_str(), s);
+
     if (access(path, F_OK) < 0) return;
+
     char buf[80];
     int len;
     int fd = open(path, O_WRONLY);
@@ -76,6 +133,7 @@ static void sysfs_write(const char *path, const char *s) {
 
 ndk::ScopedAStatus Power::setMode(Mode type, bool enabled) {
     ALOGV("Power setMode: %d to: %s", static_cast<int32_t>(type), (enabled?"on":"off"));
+    getSupportedPlatform();
     switch (type) {
         case Mode::DOUBLE_TAP_TO_WAKE:
         break;
@@ -123,6 +181,7 @@ ndk::ScopedAStatus Power::setMode(Mode type, bool enabled) {
 
 ndk::ScopedAStatus Power::setBoost(Boost type, int32_t durationMs) {
     ALOGV("Power setBoost: %d, duration: %d", static_cast<int32_t>(type), durationMs);
+    getSupportedPlatform();
     switch (type) {
         // Touch screen
         case Boost::INTERACTION:
@@ -243,11 +302,22 @@ ndk::ScopedAStatus Power::isBoostSupported(Boost type, bool* _aidl_return) {
 }
 
 void Power::performanceBoost(bool on) {
+    if (!_boot_complete) {
+        ALOGI("RK performance_boost skiped during boot!");
+        return;
+    }
+
     ALOGV("RK performance_boost Entered!");
-    sysfs_write(CPU_CLUST0_GOV_PATH, on?"performance":"interactive");
-    sysfs_write(CPU_CLUST1_GOV_PATH, on?"performance":"interactive");
-    sysfs_write((_gpu_path + "/governor").c_str(), on?"performance":"simple_ondemand");
-    sysfs_write(DMC_GOV_PATH, on?"performance":"dmc_ondemand");
+
+    if (boost_state == on) {
+        ALOGV("RK performance_boost return because of multiplicating ! %d", on);
+        return;
+    }
+    sysfs_write(CPU_CLUST0_SCAL_MIN_FREQ_PATH, on?cpu_clust0_max_freq.c_str():cpu_clust0_min_freq.c_str());
+    sysfs_write(CPU_CLUST1_SCAL_MIN_FREQ_PATH, on?cpu_clust1_max_freq.c_str():cpu_clust1_min_freq.c_str());
+    sysfs_write((_gpu_path + "/min_freq").c_str(), on?gpu_max_freq.c_str():gpu_min_freq.c_str());
+    sysfs_write(DMC_GOV_PATH, on?"p":"n");
+    boost_state = on;
 }
 
 void Power::powerSave(bool on) {
@@ -256,11 +326,17 @@ void Power::powerSave(bool on) {
     sysfs_write(CPU_CLUST0_GOV_PATH, on?"powersave":"interactive");
     sysfs_write(CPU_CLUST1_GOV_PATH, on?"powersave":"interactive");
     sysfs_write((_gpu_path + "/governor").c_str(), on?"powersave":"simple_ondemand");
-    sysfs_write(DMC_GOV_PATH, on?"powersave":"dmc_ondemand");
+    sysfs_write(DMC_GOV_PATH, on?"l":"L");
+#else
+    (void *)on;
 #endif
 }
 
 void Power::interactive() {
+    if (!_boot_complete) {
+        ALOGI("RK interactive skiped during boot!");
+        return;
+    }
     ALOGV("RK interactive Entered!");
     sysfs_write(CPU_CLUST0_GOV_PATH, "interactive");
     sysfs_write(CPU_CLUST1_GOV_PATH, "interactive");
